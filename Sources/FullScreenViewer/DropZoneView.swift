@@ -11,7 +11,7 @@ struct DropZoneView: View {
             Image(systemName: "photo.on.rectangle.angled")
                 .font(.system(size: 48))
                 .foregroundStyle(.secondary)
-            Text("画像フォルダをドロップ")
+            Text("フォルダまたはファイルをドロップ")
                 .font(.title2)
                 .foregroundStyle(.secondary)
         }
@@ -33,11 +33,8 @@ struct DropZoneView: View {
         provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
             guard let data = item as? Data,
                   let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),
-                  isDir.boolValue else { return }
             DispatchQueue.main.async {
-                imageStore.loadFolder(url)
+                imageStore.load(url)
             }
         }
         return true

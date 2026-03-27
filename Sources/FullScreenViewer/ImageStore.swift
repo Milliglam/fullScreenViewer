@@ -1,44 +1,216 @@
 import SwiftUI
+import Foundation
 
-/// 画像一覧と現在のインデックスを管理する共有ストア
+/// メディア一覧と現在のインデックスを管理する共有ストア
 class ImageStore: ObservableObject {
-    @Published var imageURLs: [URL] = []
+    @Published var mediaURLs: [URL] = []
     @Published var currentIndex: Int = 0
     @Published var isViewerActive: Bool = false
 
-    private let supportedExtensions: Set<String> = [
+    private let imageExtensions: Set<String> = [
         "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "heic"
     ]
 
-    /// フォルダ内の画像をファイル名の自然順でロードする
+    private let videoExtensions: Set<String> = [
+        "mp4", "mov", "mkv", "mpg", "mpeg", "avi", "webm", "m4v"
+    ]
+
+    /// ffmpegで変換が必要な形式
+    private let needsConversionExtensions: Set<String> = [
+        "mkv", "avi", "webm"
+    ]
+
+    /// -c copy（コンテナ変換のみ）を試してよい形式
+    /// aviはコーデック非対応が多いので常に再エンコードする
+    private let copyableExtensions: Set<String> = [
+        "mkv", "webm"
+    ]
+
+    private var supportedExtensions: Set<String> {
+        imageExtensions.union(videoExtensions)
+    }
+
+    /// 変換済みファイルのキャッシュ（元URL → 変換後URL）
+    private var conversionCache: [URL: URL] = [:]
+
+    /// 一時ディレクトリ
+    private let tempDir: URL = {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("FullScreenViewer")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    /// 現在のファイルがムービーかどうか
+    func isVideo(at index: Int) -> Bool {
+        guard index >= 0 && index < mediaURLs.count else { return false }
+        return videoExtensions.contains(mediaURLs[index].pathExtension.lowercased())
+    }
+
+    /// 変換が必要なファイルかどうか
+    func needsConversion(at index: Int) -> Bool {
+        guard index >= 0 && index < mediaURLs.count else { return false }
+        return needsConversionExtensions.contains(mediaURLs[index].pathExtension.lowercased())
+    }
+
+    /// 再生用URLを取得（変換済みキャッシュがあればそちらを返す）
+    func playableURL(at index: Int) -> URL? {
+        guard index >= 0 && index < mediaURLs.count else { return nil }
+        let url = mediaURLs[index]
+        return conversionCache[url] ?? url
+    }
+
+    /// ffmpegで変換
+    func convertVideo(at index: Int, completion: @escaping (Result<URL, Error>) -> Void) {
+        guard index >= 0 && index < mediaURLs.count else {
+            completion(.failure(ConversionError.invalidIndex))
+            return
+        }
+
+        let sourceURL = mediaURLs[index]
+        let ext = sourceURL.pathExtension.lowercased()
+
+        // キャッシュ済みなら即返す
+        if let cached = conversionCache[sourceURL],
+           FileManager.default.fileExists(atPath: cached.path) {
+            completion(.success(cached))
+            return
+        }
+
+        let outputURL = tempDir.appendingPathComponent(
+            sourceURL.deletingPathExtension().lastPathComponent + "_converted.mp4"
+        )
+
+        // 既に変換ファイルが存在すれば再利用
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            conversionCache[sourceURL] = outputURL
+            completion(.success(outputURL))
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
+            // mkv/webm は -c copy を先に試す（aviはスキップ）
+            if self.copyableExtensions.contains(ext) {
+                if self.runFFmpeg(input: sourceURL, output: outputURL, args: ["-c", "copy"]) {
+                    self.conversionCache[sourceURL] = outputURL
+                    DispatchQueue.main.async { completion(.success(outputURL)) }
+                    return
+                }
+                try? FileManager.default.removeItem(at: outputURL)
+            }
+
+            // ハードウェアエンコード（VideoToolbox）
+            if self.runFFmpeg(input: sourceURL, output: outputURL, args: [
+                "-c:v", "h264_videotoolbox",
+                "-b:v", "8000k",
+                "-c:a", "aac",
+                "-b:a", "192k"
+            ]) {
+                self.conversionCache[sourceURL] = outputURL
+                DispatchQueue.main.async { completion(.success(outputURL)) }
+                return
+            }
+
+            try? FileManager.default.removeItem(at: outputURL)
+            DispatchQueue.main.async {
+                completion(.failure(ConversionError.conversionFailed))
+            }
+        }
+    }
+
+    /// ffmpegコマンドを実行
+    private func runFFmpeg(input: URL, output: URL, args: [String]) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg")
+        process.arguments = ["-i", input.path, "-y"] + args + [output.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    /// 一時ファイルをクリーンアップ
+    func cleanupTempFiles() {
+        conversionCache.removeAll()
+        try? FileManager.default.removeItem(at: tempDir)
+    }
+
+    /// フォルダまたは単品ファイルをロードする（既存リストに追加）
+    func load(_ url: URL) {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return }
+
+        if isDir.boolValue {
+            loadFolder(url)
+        } else if supportedExtensions.contains(url.pathExtension.lowercased()) {
+            // 重複チェック
+            if !mediaURLs.contains(url) {
+                let insertIndex = mediaURLs.count
+                mediaURLs.append(url)
+                currentIndex = insertIndex
+            }
+            isViewerActive = true
+        }
+    }
+
+    /// フォルダ内のメディアを再帰的にスキャンし、既存リストに追加する
     func loadFolder(_ url: URL) {
-        let fm = FileManager.default
-        guard let contents = try? fm.contentsOfDirectory(
-            at: url,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else { return }
+        let media = scanFolder(url)
+        guard !media.isEmpty else { return }
 
-        let images = contents
-            .filter { supportedExtensions.contains($0.pathExtension.lowercased()) }
-            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        // 重複を除外して追加
+        let existing = Set(mediaURLs)
+        let newMedia = media.filter { !existing.contains($0) }
+        guard !newMedia.isEmpty else {
+            isViewerActive = true
+            return
+        }
 
-        guard !images.isEmpty else { return }
-
-        imageURLs = images
-        currentIndex = 0
+        let insertIndex = mediaURLs.count
+        mediaURLs.append(contentsOf: newMedia)
+        currentIndex = insertIndex
         isViewerActive = true
     }
 
-    func next() {
-        if currentIndex < imageURLs.count - 1 {
-            currentIndex += 1
+    /// フォルダを再帰的にスキャンしてメディアファイルを収集
+    private func scanFolder(_ url: URL) -> [URL] {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var files: [URL] = []
+        for case let fileURL as URL in enumerator {
+            if supportedExtensions.contains(fileURL.pathExtension.lowercased()) {
+                files.append(fileURL)
+            }
         }
+
+        // パス全体で自然順ソート
+        return files.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
     }
 
+    /// ループ付き次へ
+    func next() {
+        currentIndex = (currentIndex + 1) % mediaURLs.count
+    }
+
+    /// ループ付き前へ
     func previous() {
-        if currentIndex > 0 {
-            currentIndex -= 1
-        }
+        currentIndex = (currentIndex - 1 + mediaURLs.count) % mediaURLs.count
+    }
+
+    enum ConversionError: Error {
+        case invalidIndex
+        case conversionFailed
     }
 }
