@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct ImageViewerView: View {
     @EnvironmentObject var imageStore: ImageStore
     @State private var isDropTargeted = false
+    @FocusState private var isFocused: Bool
 
     var body: some View {
         ZStack {
@@ -27,6 +28,8 @@ struct ImageViewerView: View {
             }
         }
         .focusable()
+        .focused($isFocused)
+        .focusEffectDisabled()
         .onKeyPress(.leftArrow) { imageStore.previous(); return .handled }
         .onKeyPress(.rightArrow) { imageStore.next(); return .handled }
         .onKeyPress(.upArrow) { imageStore.previous(); return .handled }
@@ -41,6 +44,7 @@ struct ImageViewerView: View {
         }
         .onAppear {
             enterFullScreen()
+            isFocused = true
         }
     }
 
