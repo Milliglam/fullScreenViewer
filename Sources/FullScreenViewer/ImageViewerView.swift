@@ -351,14 +351,28 @@ struct ImageViewerView: View {
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first else { return false }
-        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
-            guard let data = item as? Data,
-                  let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-            DispatchQueue.main.async {
-                cleanupPlayer()
-                imageStore.load(url)
+        guard !providers.isEmpty else { return false }
+        let group = DispatchGroup()
+        var urls: [URL] = []
+        let lock = NSLock()
+
+        for provider in providers {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
+                defer { group.leave() }
+                guard let data = item as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                lock.lock()
+                urls.append(url)
+                lock.unlock()
             }
+        }
+
+        group.notify(queue: .main) {
+            guard !urls.isEmpty else { return }
+            cleanupPlayer()
+            let sorted = urls.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+            imageStore.loadMultiple(sorted)
         }
         return true
     }

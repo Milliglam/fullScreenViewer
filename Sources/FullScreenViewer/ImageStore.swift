@@ -142,71 +142,93 @@ class ImageStore: ObservableObject {
         try? FileManager.default.removeItem(at: tempDir)
     }
 
-    /// フォルダまたは単品ファイルをロードする（既存リストに追加）
-    func load(_ url: URL) {
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return }
-
-        if isDir.boolValue {
-            loadFolder(url)
-        } else if supportedExtensions.contains(url.pathExtension.lowercased()) {
-            // 重複チェック
-            if !mediaURLs.contains(url) {
-                let insertIndex = mediaURLs.count
-                mediaURLs.append(url)
-                currentIndex = insertIndex
-            }
+    /// 複数URLをロードする（フォルダ・ファイル混在可）
+    func loadMultiple(_ urls: [URL]) {
+        let startIndex = mediaURLs.count
+        for url in urls {
+            loadSingle(url)
+        }
+        // 新しいファイルが追加された場合、最初の追加位置から表示
+        if mediaURLs.count > startIndex {
+            currentIndex = startIndex
             isViewerActive = true
         }
     }
 
-    /// フォルダ内のメディアを再帰的にスキャンし、既存リストに追加する
-    func loadFolder(_ url: URL) {
-        let media = scanFolder(url)
-        guard !media.isEmpty else { return }
-
-        // 重複を除外して追加
-        let existing = Set(mediaURLs)
-        let newMedia = media.filter { !existing.contains($0) }
-        guard !newMedia.isEmpty else {
+    /// フォルダまたは単品ファイルをロードする（既存リストに追加）
+    func load(_ url: URL) {
+        let startIndex = mediaURLs.count
+        loadSingle(url)
+        if mediaURLs.count > startIndex {
+            currentIndex = startIndex
             isViewerActive = true
-            return
         }
+    }
 
-        let insertIndex = mediaURLs.count
-        mediaURLs.append(contentsOf: newMedia)
-        currentIndex = insertIndex
-        isViewerActive = true
+    /// 内部用：1つのURLを処理してリストに追加（isViewerActiveは変更しない）
+    private func loadSingle(_ url: URL) {
+        // セキュリティスコープ付きアクセス
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return }
+
+        if isDir.boolValue {
+            let media = scanFolder(url)
+            let existing = Set(mediaURLs)
+            let newMedia = media.filter { !existing.contains($0) }
+            mediaURLs.append(contentsOf: newMedia)
+        } else if supportedExtensions.contains(url.pathExtension.lowercased()) {
+            if !mediaURLs.contains(url) {
+                mediaURLs.append(url)
+            }
+        }
     }
 
     /// フォルダを再帰的にスキャンしてメディアファイルを収集
     private func scanFolder(_ url: URL) -> [URL] {
         let fm = FileManager.default
-        guard let enumerator = fm.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
 
-        var files: [URL] = []
-        for case let fileURL as URL in enumerator {
-            if supportedExtensions.contains(fileURL.pathExtension.lowercased()) {
-                files.append(fileURL)
+        // まず再帰スキャン（enumerator）
+        if let enumerator = fm.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            var files: [URL] = []
+            for case let fileURL as URL in enumerator {
+                if supportedExtensions.contains(fileURL.pathExtension.lowercased()) {
+                    files.append(fileURL)
+                }
+            }
+            if !files.isEmpty {
+                return files.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
             }
         }
 
-        // パス全体で自然順ソート
-        return files.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        // enumeratorが失敗した場合、フラットスキャンにフォールバック
+        guard let contents = try? fm.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        return contents
+            .filter { supportedExtensions.contains($0.pathExtension.lowercased()) }
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
     }
 
-    /// ループ付き次へ
     func next() {
-        currentIndex = (currentIndex + 1) % mediaURLs.count
+        if currentIndex < mediaURLs.count - 1 {
+            currentIndex += 1
+        }
     }
 
-    /// ループ付き前へ
     func previous() {
-        currentIndex = (currentIndex - 1 + mediaURLs.count) % mediaURLs.count
+        if currentIndex > 0 {
+            currentIndex -= 1
+        }
     }
 
     enum ConversionError: Error {
