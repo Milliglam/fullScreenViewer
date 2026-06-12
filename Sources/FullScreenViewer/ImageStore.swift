@@ -7,6 +7,11 @@ class ImageStore: ObservableObject {
     @Published var currentIndex: Int = 0
     @Published var isViewerActive: Bool = false
 
+    /// フォルダ自体の順番をランダムにする
+    @Published var shuffleFolders: Bool = false
+    /// 各フォルダ内のファイル順をランダムにする
+    @Published var shuffleFiles: Bool = false
+
     private let imageExtensions: Set<String> = [
         "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "heic"
     ]
@@ -142,12 +147,21 @@ class ImageStore: ObservableObject {
         try? FileManager.default.removeItem(at: tempDir)
     }
 
-    /// 複数URLをロードする（フォルダ・ファイル混在可）
+    /// 複数URLをロードする（フォルダ・ファイル混在可）。
+    /// ランダム設定に応じてフォルダ順・各フォルダ内のファイル順をシャッフルする。
     func loadMultiple(_ urls: [URL]) {
         let startIndex = mediaURLs.count
-        for url in urls {
-            loadSingle(url)
-        }
+        var seen = Set(mediaURLs)
+
+        // 各トップレベルをブロックに展開（フォルダ=1ブロック、単品ファイル=1要素ブロック）
+        var blocks = urls.map { expand($0) }.filter { !$0.isEmpty }
+        if shuffleFiles { blocks = blocks.map { $0.shuffled() } }   // 各フォルダ内をシャッフル
+        if shuffleFolders { blocks.shuffle() }                     // フォルダの順番をシャッフル
+
+        // 既存リスト＋バッチ内の重複を順序維持で除外
+        let newMedia = blocks.flatMap { $0 }.filter { seen.insert($0).inserted }
+
+        mediaURLs.append(contentsOf: newMedia)
         // 新しいファイルが追加された場合、最初の追加位置から表示
         if mediaURLs.count > startIndex {
             currentIndex = startIndex
@@ -157,33 +171,33 @@ class ImageStore: ObservableObject {
 
     /// フォルダまたは単品ファイルをロードする（既存リストに追加）
     func load(_ url: URL) {
-        let startIndex = mediaURLs.count
-        loadSingle(url)
-        if mediaURLs.count > startIndex {
-            currentIndex = startIndex
-            isViewerActive = true
-        }
+        loadMultiple([url])
     }
 
-    /// 内部用：1つのURLを処理してリストに追加（isViewerActiveは変更しない）
-    private func loadSingle(_ url: URL) {
+    /// ビューアを閉じて読み込み済みリストをクリアする（Escでの終了時に使用）。
+    /// ランダム設定（shuffleFolders/shuffleFiles）は維持する。
+    func reset() {
+        mediaURLs.removeAll()
+        currentIndex = 0
+        isViewerActive = false
+    }
+
+    /// トップレベルURLをメディア列に展開する
+    /// （フォルダ=再帰スキャンしてソート済み、単品ファイル=それ自身）
+    private func expand(_ url: URL) -> [URL] {
         // セキュリティスコープ付きアクセス
         let accessing = url.startAccessingSecurityScopedResource()
         defer { if accessing { url.stopAccessingSecurityScopedResource() } }
 
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return }
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return [] }
 
         if isDir.boolValue {
-            let media = scanFolder(url)
-            let existing = Set(mediaURLs)
-            let newMedia = media.filter { !existing.contains($0) }
-            mediaURLs.append(contentsOf: newMedia)
+            return scanFolder(url)
         } else if supportedExtensions.contains(url.pathExtension.lowercased()) {
-            if !mediaURLs.contains(url) {
-                mediaURLs.append(url)
-            }
+            return [url]
         }
+        return []
     }
 
     /// フォルダを再帰的にスキャンしてメディアファイルを収集

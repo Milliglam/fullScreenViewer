@@ -171,7 +171,7 @@ struct ImageViewerView: View {
             stopMouseMonitor()
             imageStore.cleanupTempFiles()
             exitFullScreen()
-            imageStore.isViewerActive = false
+            imageStore.reset()
             return true
         default:
             break
