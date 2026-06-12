@@ -7,6 +7,7 @@ struct ImageViewerView: View {
     @EnvironmentObject var imageStore: ImageStore
     @State private var isDropTargeted = false
     @State private var player: AVPlayer?
+    @State private var endObserver: NSObjectProtocol?
     @State private var playerError = false
     @State private var isConverting = false
     @State private var isFillMode = false
@@ -144,13 +145,13 @@ struct ImageViewerView: View {
         case 123:
             if modifiers.contains(.command) { seek(by: -30) }
             else if modifiers.contains(.shift) { seek(by: -5) }
-            else { navigate { imageStore.previous() } }
+            else { navigate(forward: false) }
             return true
         // 右矢印
         case 124:
             if modifiers.contains(.command) { seek(by: 30) }
             else if modifiers.contains(.shift) { seek(by: 5) }
-            else { navigate { imageStore.next() } }
+            else { navigate(forward: true) }
             return true
         // 上矢印
         case 126:
@@ -209,9 +210,14 @@ struct ImageViewerView: View {
 
     // MARK: - プレイヤー制御
 
-    private func navigate(_ action: () -> Void) {
+    private func navigate(forward: Bool) {
+        // 端では何もしない（再生を維持し、末尾右キー・先頭左キーでの黒画面化を防ぐ）
+        let canMove = forward
+            ? imageStore.currentIndex < imageStore.mediaURLs.count - 1
+            : imageStore.currentIndex > 0
+        guard canMove else { return }
         cleanupPlayer()
-        action()
+        forward ? imageStore.next() : imageStore.previous()
     }
 
     private func updatePlayer() {
@@ -263,11 +269,13 @@ struct ImageViewerView: View {
 
         observePlayerStatus(item, generation: generation)
 
-        NotificationCenter.default.addObserver(
+        endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: item,
             queue: .main
         ) { _ in
+            // 世代チェック：送った直後に積まれた遅延通知での誤った自動送り（＝飛ばし）を防ぐ
+            guard navigationGeneration == generation else { return }
             autoAdvance()
         }
 
@@ -292,6 +300,8 @@ struct ImageViewerView: View {
     }
 
     private func autoAdvance() {
+        // 末尾では送らず最後のフレームを維持（最終動画終了後の黒画面を防ぐ）
+        guard imageStore.currentIndex < imageStore.mediaURLs.count - 1 else { return }
         cleanupPlayer()
         imageStore.next()
     }
@@ -328,8 +338,10 @@ struct ImageViewerView: View {
 
     private func cleanupPlayer() {
         player?.pause()
-        if let item = player?.currentItem {
-            NotificationCenter.default.removeObserver(self, name: .AVPlayerItemDidPlayToEndTime, object: item)
+        // ブロック形式で登録した監視はトークンでのみ解除できる（self指定では外れない）
+        if let obs = endObserver {
+            NotificationCenter.default.removeObserver(obs)
+            endObserver = nil
         }
         player = nil
     }
