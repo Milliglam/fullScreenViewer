@@ -54,6 +54,7 @@ struct DropZoneView: View {
             GridRow { shortcutCell("Shift+← →", "5秒シーク");   shortcutCell("0–9", "10%位置へジャンプ") }
             GridRow { shortcutCell("⌘+← →", "30秒シーク");      shortcutCell("F", "フィット / フィル切替") }
             GridRow { shortcutCell("↑ ↓", "音量");             shortcutCell("Esc", "終了") }
+            GridRow { shortcutCell("⌘N", "新規ウィンドウ") }
         }
     }
 

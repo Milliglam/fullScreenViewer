@@ -16,6 +16,11 @@ struct ImageViewerView: View {
     @State private var mouseMonitor: Any?
     @State private var keyMonitor: Any?
     @State private var navigationGeneration: Int = 0
+    /// このビューをホストするウィンドウ（複数ウィンドウでのイベント分離・フルスクリーン制御に使用）
+    @State private var hostWindow: NSWindow?
+    /// 再生進捗（0.0〜1.0）
+    @State private var progress: Double = 0
+    @State private var timeObserver: Any?
     /// UI自動非表示までの秒数
     private let uiHideDelay: TimeInterval = 3.0
 
@@ -32,7 +37,7 @@ struct ImageViewerView: View {
                             ProgressView()
                                 .scaleEffect(1.5)
                                 .tint(.white)
-                            Text("変換中...")
+                            Text("準備中...")
                                 .foregroundStyle(.white.opacity(0.5))
                             Text(url.lastPathComponent)
                                 .font(.caption)
@@ -68,9 +73,12 @@ struct ImageViewerView: View {
                     Spacer()
                     HStack {
                         Spacer()
-                        Text("\(imageStore.currentIndex + 1) / \(imageStore.mediaURLs.count)")
+                        Text("\(imageStore.currentIndex + 1) / \(imageStore.mediaURLs.count) · \(currentFileName)")
                             .font(.caption)
                             .foregroundStyle(.white.opacity(0.7))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .padding(.horizontal, 64)   // 右端のフィルモードボタンと重ならない余白
                         Spacer()
                     }
                     .overlay(alignment: .trailing) {
@@ -85,26 +93,71 @@ struct ImageViewerView: View {
                         .buttonStyle(.plain)
                         .padding(.trailing, 16)
                     }
-                    .padding(.bottom, 12)
+                    .padding(.bottom, 18)   // 再生バー（4px）と重ならない位置
                 }
                 .transition(.opacity)
             }
         }
+        .overlay(alignment: .bottom) { progressBar }
+        .background(WindowAccessor(window: $hostWindow))
         .animation(.easeInOut(duration: 0.3), value: showUI)
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers)
         }
         .onAppear {
-            enterFullScreen()
             updatePlayer()
             startMouseMonitor()
             startKeyMonitor()
         }
         .onDisappear {
-            stopMouseMonitor()
+            // Escでもウィンドウクローズでも同じ解放保証を通す
+            shutdownViewer()
         }
         .onChange(of: imageStore.currentIndex) {
             updatePlayer()
+        }
+        .onChange(of: hostWindow) {
+            // WindowAccessorがウィンドウを取得した時点で自ウィンドウだけをフルスクリーン化
+            enterFullScreenIfNeeded()
+        }
+    }
+
+    /// ビューア終了時の共通後始末（Esc・ウィンドウクローズのどの経路でも同じ解放を保証。冪等）
+    private func shutdownViewer() {
+        cleanupPlayer()
+        stopMouseMonitor()
+        imageStore.cleanupTempFiles()
+    }
+
+    /// 現在表示中のファイル名
+    private var currentFileName: String {
+        guard imageStore.currentIndex >= 0 && imageStore.currentIndex < imageStore.mediaURLs.count else { return "" }
+        return imageStore.mediaURLs[imageStore.currentIndex].lastPathComponent
+    }
+
+    /// 画面最下部の再生バー（視覚は下端4px・クリック領域は最下部20px。
+    /// クリック位置の割合＝動画の該当位置へシークする。ドラッグシークはなし）
+    @ViewBuilder
+    private var progressBar: some View {
+        if player != nil {
+            GeometryReader { geo in
+                ZStack(alignment: .bottomLeading) {
+                    Color.clear
+                    Rectangle()
+                        .fill(.white.opacity(0.08))
+                        .frame(height: 4)
+                    Rectangle()
+                        .fill(.white.opacity(0.4))
+                        .frame(width: geo.size.width * progress, height: 4)
+                }
+                .contentShape(Rectangle())
+                .gesture(SpatialTapGesture().onEnded { value in
+                    guard geo.size.width > 0 else { return }
+                    seekToPercent(min(max(value.location.x / geo.size.width, 0), 1))
+                })
+            }
+            .frame(height: 20)
+            .animation(.linear(duration: 0.1), value: progress)
         }
     }
 
@@ -112,6 +165,8 @@ struct ImageViewerView: View {
 
     private func startMouseMonitor() {
         mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown]) { event in
+            // ローカルモニターはアプリ全体に届くため、自ウィンドウのイベントだけ処理する
+            guard event.window === hostWindow else { return event }
             revealUI()
             return event
         }
@@ -119,6 +174,8 @@ struct ImageViewerView: View {
 
     private func startKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // フォーカス中の自ウィンドウ宛のキーだけ処理（他ウィンドウのビューアには反応させない）
+            guard event.window === hostWindow else { return event }
             return handleKeyEvent(event) ? nil : event
         }
     }
@@ -167,9 +224,7 @@ struct ImageViewerView: View {
             return true
         // Escape
         case 53:
-            cleanupPlayer()
-            stopMouseMonitor()
-            imageStore.cleanupTempFiles()
+            shutdownViewer()
             exitFullScreen()
             imageStore.reset()
             return true
@@ -241,7 +296,7 @@ struct ImageViewerView: View {
 
             let targetIndex = imageStore.currentIndex
             isConverting = true
-            imageStore.convertVideo(at: targetIndex) { result in
+            imageStore.startStreaming(at: targetIndex) { result in
                 // 世代チェック：連打で先に進んでいたら無視
                 guard navigationGeneration == currentGen else { return }
                 switch result {
@@ -279,6 +334,19 @@ struct ImageViewerView: View {
             autoAdvance()
         }
 
+        // 再生バー用の進捗監視（0.1秒間隔）
+        progress = 0
+        timeObserver = newPlayer.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.1, preferredTimescale: 600),
+            queue: .main
+        ) { [weak newPlayer] time in
+            // playerを強参照すると player→observer→closure→player の保持循環になる
+            guard navigationGeneration == generation,
+                  let p = newPlayer,
+                  let duration = effectiveDuration(of: p) else { return }
+            progress = min(max(time.seconds / duration, 0), 1)
+        }
+
         newPlayer.play()
     }
 
@@ -287,14 +355,14 @@ struct ImageViewerView: View {
             guard navigationGeneration == generation else { return }
             if item.status == .failed {
                 playerError = true
-                player = nil
+                cleanupPlayer()   // player=nil直接代入だとオブザーバーが残る
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             guard navigationGeneration == generation else { return }
             if item.status == .failed {
                 playerError = true
-                player = nil
+                cleanupPlayer()
             }
         }
     }
@@ -315,18 +383,36 @@ struct ImageViewerView: View {
         }
     }
 
+    /// 再生中アイテムの実効的な長さ。イベント型HLSプレイリスト（ストリーミング変換中）は
+    /// ENDLIST到達までdurationが不定のため、ffprobeで取得した実尺を優先して使う
+    /// （プレイリスト全長を分母にすると変換の進行に伴って再生バーが伸び縮みするため）。
+    /// 実尺も取れていない間はシーク可能範囲の末尾へフォールバック
+    private func effectiveDuration(of player: AVPlayer) -> Double? {
+        guard let item = player.currentItem else { return nil }
+        let duration = item.duration.seconds
+        if duration.isFinite && duration > 0 { return duration }
+        if let probed = imageStore.probedDuration(at: imageStore.currentIndex) {
+            return probed
+        }
+        if let range = item.seekableTimeRanges.last?.timeRangeValue {
+            let end = CMTimeRangeGetEnd(range).seconds
+            if end.isFinite && end > 0 { return end }
+        }
+        return nil
+    }
+
     /// 指定秒数だけシーク
     private func seek(by seconds: Double) {
-        guard let player = player, let duration = player.currentItem?.duration else { return }
+        guard let player = player, let duration = effectiveDuration(of: player) else { return }
         let current = player.currentTime().seconds
-        let target = min(max(current + seconds, 0), duration.seconds)
+        let target = min(max(current + seconds, 0), duration)
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
     /// 動画の指定割合の位置へジャンプ
     private func seekToPercent(_ percent: Double) {
-        guard let player = player, let duration = player.currentItem?.duration else { return }
-        let target = duration.seconds * percent
+        guard let player = player, let duration = effectiveDuration(of: player) else { return }
+        let target = duration * percent
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
@@ -343,20 +429,24 @@ struct ImageViewerView: View {
             NotificationCenter.default.removeObserver(obs)
             endObserver = nil
         }
+        // 時間監視は登録先playerの解放前に必ず外す
+        if let obs = timeObserver {
+            player?.removeTimeObserver(obs)
+            timeObserver = nil
+        }
+        progress = 0
         player = nil
     }
 
-    private func enterFullScreen() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            guard let window = NSApplication.shared.mainWindow else { return }
-            if !window.styleMask.contains(.fullScreen) {
-                window.toggleFullScreen(nil)
-            }
-        }
+    // mainWindowへのフォールバックは複数ウィンドウ分離を破る（別ウィンドウを操作し得る）ため、
+    // hostWindow確定時のみ操作する
+    private func enterFullScreenIfNeeded() {
+        guard let window = hostWindow, !window.styleMask.contains(.fullScreen) else { return }
+        window.toggleFullScreen(nil)
     }
 
     private func exitFullScreen() {
-        guard let window = NSApplication.shared.mainWindow else { return }
+        guard let window = hostWindow else { return }
         if window.styleMask.contains(.fullScreen) {
             window.toggleFullScreen(nil)
         }
@@ -387,6 +477,28 @@ struct ImageViewerView: View {
             imageStore.loadMultiple(sorted)
         }
         return true
+    }
+}
+
+/// ホストするNSWindowをSwiftUI側へ渡すヘルパー
+struct WindowAccessor: NSViewRepresentable {
+    @Binding var window: NSWindow?
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        // windowはビュー階層への追加後でないと取れないため次のランループで取得
+        DispatchQueue.main.async {
+            window = view.window
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            if window !== nsView.window {
+                window = nsView.window
+            }
+        }
     }
 }
 

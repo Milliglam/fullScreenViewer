@@ -12,12 +12,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct FullScreenViewerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @StateObject private var imageStore = ImageStore()
 
     var body: some Scene {
+        // ストアはContentView側でウィンドウごとに生成する（複数ウィンドウ同時再生のため）
         WindowGroup {
             ContentView()
-                .environmentObject(imageStore)
         }
         .defaultSize(width: 480, height: 360)
     }
