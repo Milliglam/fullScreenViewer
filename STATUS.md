@@ -1,7 +1,6 @@
 # FullScreenViewer
-状態: active
-フェーズ: 追加アップデート完了（mkv即時再生◎確認済み）＋変換中シークバーの伸縮改善＋codex-reviewクリーン（2026-07-28）・最終目視待ち
-次のアクション: 佐藤さんの最終確認（**⌘Q→再起動**。mkv再生直後にクリックシークしてもバーが伸び縮みせず、最初から実尺基準で安定しているか）。OKなら全部まとめてcommit（**新規ファイルSources/FullScreenViewer/HLSServer.swiftのgit add漏れ注意**）
-確認済み(07-28佐藤さん): mkv即時再生◎・キャッシュ再利用◎・mp4/画像リグレッションなし◎・クリックシーク◎
-メモ: 今回追加=①クリックシーク（最下部20pxクリック領域・視覚バーは4px・SpatialTapGesture→seekToPercent）②mkv/avi/webmのHLSストリーミング即時再生（ffprobeでコーデック判定→h264/hevcは-c:v copy（hevcは-tag:v hvc1）/他はVideoToolbox再エンコード、音声は常にAAC。event型fMP4プレイリストを書きながらAVPlayerで即再生。プレイリスト出現ポーリング10sタイムアウト。ENDLISTまでdurationが不定のためseekableTimeRanges末尾をフォールバックにするeffectiveDuration導入）。並行安全設計=StreamJob（ジョブ単位失敗フラグ）+publishStream/failStreamJobをstateLockで順序付け、キャッシュ（conversionCache）のみを再利用の正本とする。**重要な学び: AVPlayerはfile://のHLSプレイリストを再生できない（CoreMediaErrorDomain -12865）**→ HLSServer.swift（新規）=Network.framework製の最小ループバックHTTPサーバ（127.0.0.1限定・エフェメラルポート・GET/Range対応・トラバーサル防止）でtempDirを配信し、http://127.0.0.1:<port>/<hash>/index.m3u8 をAVPlayerへ渡す（ATSはループバック適用外でhttp可）。単体検証済み（swiftc直コンパイル+AVPlayerでREADY/再生進行）。codex-review 計5反復でok:true（指摘=公開/失敗掃除の競合→StreamJob導入、再利用分岐の迂回→分岐削除、playableURL誤削除→ロック内で実体再確認、startStreamingのキャッシュ実体確認がfile前提→localFilePath(for:)でマップ）。変換中シークバー伸縮の改善(07-28追記)=probeSourceでffprobeからcodec+format=durationを同時取得→stateLock+世代確認付きでprobedDurations[URL:Double]に保存→effectiveDurationの分母優先順位を「item.duration確定値→ffprobe実尺→seekable末尾」に（バーが最初から実尺基準で安定。変換未到達位置へのシークはクランプ=仕様）。この分もcodex-review 2反復でok:true（指摘=実尺保存の世代未保護→世代確認付きに）。リリースビルド→.appバンドル更新済み。**未コミット**（前回の複数ウィンドウ+再生バー+ファイル名分含む）。ビルドは `swift build --disable-sandbox -c release`。レビューログ=_scratch/codex_review/（arch_*=前回、hls_*=今回）
+状態: dormant
+フェーズ: 機能アップデート完了・commit/push済み（2026-07-28、main 2d6d3a9）
+次のアクション: なし（必要時に機能追加）
+メモ: macOS用フルスクリーンメディアビューア。Swift/SwiftUI、ffmpeg動画変換付き。2026-07-28アップデート=複数ウィンドウ同時再生（ストア/イベント/tempDir分離、⌘N）・最下部再生バー（視覚4px/クリック領域20pxでクリックシーク）・ファイル名表示・mkv/avi/webmのHLSストリーミング即時再生（ffprobe判定→H.264/HEVC無劣化コピー/他はVideoToolbox、ループバックHTTP配信=HLSServer.swift。**AVPlayerはfile://のHLSを再生不可（-12865）が要点**）・変換中バーはffprobe実尺基準。並行安全=世代管理+StreamJob+stateLock。全機能佐藤さん目視確認済み。codex-review計8反復ok:true。ビルド=`swift build --disable-sandbox -c release`→バイナリをFullScreenViewer.app/Contents/MacOS/へコピー。検証素材・レビューログ=_scratch/（git管理外）
 更新日: 2026-07-28
