@@ -1,5 +1,6 @@
 import SwiftUI
 import AVKit
+import CoreImage
 import UniformTypeIdentifiers
 
 /// フルスクリーンでメディア（画像・ムービー）を表示するビューア
@@ -21,8 +22,17 @@ struct ImageViewerView: View {
     /// 再生進捗（0.0〜1.0）
     @State private var progress: Double = 0
     @State private var timeObserver: Any?
+    /// 一時停止中スクリーンショット用のフレーム取得口（アイテム生成時に添付）
+    @State private var videoOutput: AVPlayerItemVideoOutput?
+    /// 現在トラックの回転メタデータ（VideoOutputのバッファには適用されないため保存時に自前で適用）
+    @State private var videoTransform: CGAffineTransform = .identity
+    /// スクリーンショット保存結果の通知トースト
+    @State private var captureToast: String?
+    @State private var toastTimer: Timer?
     /// UI自動非表示までの秒数
     private let uiHideDelay: TimeInterval = 3.0
+    /// スクリーンショット描画用の共有CIContext（生成コストが高いためキャプチャごとに作らない）
+    private static let screenshotCIContext = CIContext()
 
     var body: some View {
         ZStack {
@@ -97,10 +107,27 @@ struct ImageViewerView: View {
                 }
                 .transition(.opacity)
             }
+
+            // スクリーンショット保存結果のトースト
+            if let toast = captureToast {
+                VStack {
+                    Spacer()
+                    Text(toast)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.9))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(.black.opacity(0.6))
+                        .clipShape(Capsule())
+                        .padding(.bottom, 48)
+                }
+                .transition(.opacity)
+            }
         }
         .overlay(alignment: .bottom) { progressBar }
         .background(WindowAccessor(window: $hostWindow))
         .animation(.easeInOut(duration: 0.3), value: showUI)
+        .animation(.easeInOut(duration: 0.2), value: captureToast)
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers)
         }
@@ -191,6 +218,8 @@ struct ImageViewerView: View {
         }
         hideTimer?.invalidate()
         hideTimer = nil
+        toastTimer?.invalidate()
+        toastTimer = nil
     }
 
     /// キーイベント処理。trueを返すとイベントを消費
@@ -237,6 +266,11 @@ struct ImageViewerView: View {
             switch chars {
             case "f":
                 isFillMode.toggle()
+                return true
+            case "s", "S":
+                // 一時停止中のみ有効（再生中・変換中・画像表示中は素通し）
+                guard let player = player, player.timeControlStatus == .paused else { return false }
+                captureScreenshot(player: player)
                 return true
             case "0": seekToPercent(0.0); return true
             case "1": seekToPercent(0.1); return true
@@ -319,6 +353,23 @@ struct ImageViewerView: View {
         guard navigationGeneration == generation else { return }
 
         let item = AVPlayerItem(url: url)
+        // スクリーンショット用出力は再生開始後の後付けだとバッファが取れないことがあるため生成時に添付
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ])
+        item.add(output)
+        videoOutput = output
+        videoTransform = .identity
+        Task {
+            // 縦向き動画等の回転はAVPlayerLayerが表示時に適用するが、VideoOutputのバッファは素の向きのまま
+            if let track = try? await item.asset.loadTracks(withMediaType: .video).first,
+               let transform = try? await track.load(.preferredTransform) {
+                await MainActor.run {
+                    guard navigationGeneration == generation else { return }
+                    videoTransform = transform
+                }
+            }
+        }
         let newPlayer = AVPlayer(playerItem: item)
         player = newPlayer
 
@@ -422,6 +473,102 @@ struct ImageViewerView: View {
         player.volume = min(max(player.volume + delta, 0.0), 1.0)
     }
 
+    // MARK: - スクリーンショット
+
+    /// 一時停止中の現在フレームを、画面に見えている画角・ピクセルサイズのままPNGでデスクトップへ保存する。
+    /// AVAssetImageGeneratorはHLS再生（mkv等の変換ストリーミング）でフレームを取れないため、
+    /// 通常ファイル・HLS共通で動くAVPlayerItemVideoOutput経由で取得する
+    private func captureScreenshot(player: AVPlayer) {
+        guard let output = videoOutput,
+              let window = hostWindow,
+              let contentView = window.contentView else { return }
+
+        let itemTime = player.currentTime()
+        guard let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else {
+            showToast("フレームを取得できませんでした")
+            return
+        }
+
+        var image = CIImage(cvPixelBuffer: buffer)
+        // 回転メタデータを表示と同じ向きに適用し、原点をゼロへ正規化
+        if videoTransform != .identity {
+            image = image.transformed(by: videoTransform)
+            image = image.transformed(by: CGAffineTransform(translationX: -image.extent.origin.x,
+                                                            y: -image.extent.origin.y))
+        }
+        // 非正方形ピクセル等でバッファ寸法と表示寸法が異なる場合、表示基準（presentationSize）に合わせる
+        if let item = player.currentItem {
+            let pres = item.presentationSize
+            let ext = image.extent.size
+            if pres.width > 0, pres.height > 0, ext.width > 0, ext.height > 0,
+               abs(pres.width - ext.width) > 1 || abs(pres.height - ext.height) > 1 {
+                image = image.transformed(by: CGAffineTransform(scaleX: pres.width / ext.width,
+                                                                y: pres.height / ext.height))
+            }
+        }
+
+        let videoSize = image.extent.size
+        let scaleFactor = window.backingScaleFactor
+        let screenSize = CGSize(width: contentView.bounds.width * scaleFactor,
+                                height: contentView.bounds.height * scaleFactor)
+        guard videoSize.width > 0, videoSize.height > 0,
+              screenSize.width > 0, screenSize.height > 0 else { return }
+
+        // fit: 全フレームが収まる倍率（黒帯は含めない）／fill: 画面を覆う倍率で中央クロップ
+        let scale = isFillMode
+            ? max(screenSize.width / videoSize.width, screenSize.height / videoSize.height)
+            : min(screenSize.width / videoSize.width, screenSize.height / videoSize.height)
+        image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        if isFillMode {
+            let cropRect = CGRect(
+                x: image.extent.midX - screenSize.width / 2,
+                y: image.extent.midY - screenSize.height / 2,
+                width: screenSize.width,
+                height: screenSize.height
+            ).integral.intersection(image.extent)
+            image = image.cropped(to: cropRect)
+        }
+
+        guard let cgImage = Self.screenshotCIContext.createCGImage(image, from: image.extent) else {
+            showToast("画像の生成に失敗しました")
+            return
+        }
+        guard let png = NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:]) else {
+            showToast("PNGの生成に失敗しました")
+            return
+        }
+
+        // <元ファイル名>_<動画位置mm.ss>.png。同名存在時は-2,-3…で重複回避。
+        // 存在確認と書き込みの間の競合でも上書きしないよう.withoutOverwritingで排他的に生成する
+        let sourceName = imageStore.mediaURLs[imageStore.currentIndex].deletingPathExtension().lastPathComponent
+        let seconds = itemTime.seconds.isFinite ? max(itemTime.seconds, 0) : 0
+        let base = String(format: "%@_%02d.%02d", sourceName, Int(seconds) / 60, Int(seconds) % 60)
+        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
+
+        for attempt in 1...100 {
+            let name = attempt == 1 ? "\(base).png" : "\(base)-\(attempt).png"
+            let dest = desktop.appendingPathComponent(name)
+            do {
+                try png.write(to: dest, options: .withoutOverwriting)
+                showToast("保存: \(dest.lastPathComponent)")
+                return
+            } catch let error as CocoaError where error.code == .fileWriteFileExists {
+                continue
+            } catch {
+                break
+            }
+        }
+        showToast("保存に失敗しました")
+    }
+
+    private func showToast(_ message: String) {
+        captureToast = message
+        toastTimer?.invalidate()
+        toastTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { _ in
+            captureToast = nil
+        }
+    }
+
     private func cleanupPlayer() {
         player?.pause()
         // ブロック形式で登録した監視はトークンでのみ解除できる（self指定では外れない）
@@ -435,6 +582,7 @@ struct ImageViewerView: View {
             timeObserver = nil
         }
         progress = 0
+        videoOutput = nil
         player = nil
     }
 
